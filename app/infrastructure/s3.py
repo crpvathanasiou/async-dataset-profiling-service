@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 
@@ -24,12 +25,22 @@ class S3ObjectHead:
     content_length: int
 
 
+_S3_CLIENT_CONFIG = Config(
+    signature_version="s3v4",
+    s3={"addressing_style": "virtual"},
+)
+
+
 class S3Storage:
     """Thin adapter around boto3 S3 operations used by Stage 1 intake."""
 
     def __init__(self, *, region_name: str, bucket: str, client: Any | None = None) -> None:
         self._bucket = bucket
-        self._client = client or boto3.client("s3", region_name=region_name)
+        self._client = client or boto3.client(
+            "s3",
+            region_name=region_name,
+            config=_S3_CLIENT_CONFIG,
+        )
 
     @property
     def bucket(self) -> str:

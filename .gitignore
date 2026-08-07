@@ -1,0 +1,27 @@
+# Virtualenv
+.venv/
+
+# Local env vars (do not commit secrets)
+.env
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Test cache
+.pytest_cache/
+
+# Ruff cache
+.ruff_cache/
+
+# Pyright cache
+.pyright/
+
+# OS/editor
+.vscode/
+.idea/
+.DS_Store
+
+
+# === Project Specific Files ===
+template-setup-steps.txt

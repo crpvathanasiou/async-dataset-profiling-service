@@ -1,3 +1,24 @@
+"""
+Stage 1 HTTP surface.
+
+This module is the only place in the intake package that knows about HTTP. It
+declares routes, documents them for OpenAPI, resolves dependencies, and turns
+service-level exceptions into HTTP status codes.
+
+Request path:
+    client -> FastAPI router -> intake service -> S3/SQS adapters + registry
+
+Routers stay thin on purpose: no validation rules, no AWS calls, no job state
+transitions. Each handler does three things — collect input, call one service
+function, and translate a domain error into an `AppApiError`. That keeps the use
+cases testable without an HTTP layer and keeps HTTP decisions out of services.
+
+The mapping this module owns:
+    FilenameValidationError                     -> 400
+    JOB_NOT_FOUND / OBJECT_NOT_FOUND            -> 404
+    every other IntakeErrorCode (S3/SQS)        -> 503 (retryable)
+"""
+
 from functools import lru_cache
 from typing import Annotated
 
@@ -28,12 +49,30 @@ router = APIRouter(prefix="/api/v1/intake", tags=["intake"])
 
 @lru_cache(maxsize=1)
 def get_s3_storage() -> S3Storage:
+    """
+    Dependency provider for the S3 adapter.
+
+    Cached because a boto3 client is comparatively expensive to build (it loads
+    service models and resolves credentials) and is safe to reuse across
+    requests. Bucket and region come from settings, never from the request.
+
+    Being a dependency also makes it overridable: tests replace it through
+    `app.dependency_overrides` so no AWS access is needed.
+    """
     settings = get_settings()
     return S3Storage(region_name=settings.aws_region, bucket=settings.s3_input_bucket)
 
 
 @lru_cache(maxsize=1)
 def get_sqs_queue() -> SQSQueue:
+    """
+    Dependency provider for the SQS adapter used by the publish side.
+
+    Same reasoning as `get_s3_storage`: one reusable client per process, queue
+    URL and region injected from configuration. The worker process builds its own
+    `SQSQueue` instance in `app/worker/main.py`; the two processes share the queue,
+    not the client object.
+    """
     settings = get_settings()
     return SQSQueue(region_name=settings.aws_region, queue_url=settings.sqs_job_queue_url)
 
@@ -56,6 +95,17 @@ def create_upload(
     s3: Annotated[S3Storage, Depends(get_s3_storage)],
     registry: Annotated[InMemoryJobRegistry, Depends(get_job_registry)],
 ) -> CreateUploadResponse:
+    """
+    Step 1 of the primary flow: reserve a job and hand out a presigned PUT URL.
+
+    The dataset itself never passes through this endpoint; the client uploads it
+    straight to S3 with the returned URL. No SQS message is published here,
+    because nothing has been validated yet.
+
+    A rejected filename is a client mistake (HTTP 400), unlike a rejected
+    dataset, which is reported as `REJECTED` with HTTP 200 by the validate
+    endpoints.
+    """
     try:
         return create_presigned_upload(
             filename=body.filename,
@@ -64,6 +114,8 @@ def create_upload(
             registry=registry,
         )
     except FilenameValidationError as exc:
+        # The service reports every filename problem it found; the API surfaces
+        # the first one, since the request cannot proceed either way.
         error = exc.errors[0]
         raise AppApiError(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -95,6 +147,20 @@ def validate_job(
     sqs: Annotated[SQSQueue, Depends(get_sqs_queue)],
     registry: Annotated[InMemoryJobRegistry, Depends(get_job_registry)],
 ) -> IntakeJobResponse:
+    """
+    Step 2 of the primary flow: validate the uploaded object and hand it off.
+
+    Only the `job_id` is accepted from the client; the S3 key is resolved from the
+    registry, so a caller cannot aim validation at an arbitrary object.
+
+    This endpoint contains the asynchronous boundary: on `VALIDATED` the service
+    publishes a `PROCESS_DATASET` command to SQS, and the actual processing
+    happens later in the worker process. The response therefore reports the
+    validation verdict, not the processing result.
+
+    Both outcomes below are HTTP 200 with a body: `VALIDATED` and `REJECTED`. Only
+    failures of the operation itself become error responses.
+    """
     try:
         return validate_s3_intake_job(
             job_id=job_id,
@@ -104,6 +170,9 @@ def validate_job(
             registry=registry,
         )
     except IntakeServiceError as exc:
+        # Missing job/object means the client asked about something that is not
+        # there; the remaining codes are S3/SQS trouble on our side and are
+        # reported as retryable 503 rather than as a dataset rejection.
         if exc.code in {IntakeErrorCode.JOB_NOT_FOUND, IntakeErrorCode.OBJECT_NOT_FOUND}:
             raise AppApiError(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -131,6 +200,17 @@ async def create_intake_job_legacy(
     file: Annotated[UploadFile, File(description="CSV file to validate.")],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> IntakeJobResponse:
+    """
+    Legacy/local path: upload and validate inside one request.
+
+    Kept for quick local experiments and as a reference for the pure validation
+    rules. It differs from the production path in three ways: the file passes
+    through the application process, no job is stored in the registry, and no SQS
+    message is published — so it never reaches the worker.
+
+    Declared `async` because reading an `UploadFile` is awaited; the validation
+    that follows is synchronous CPU work.
+    """
     content = await file.read()
     return process_intake(
         filename=file.filename,

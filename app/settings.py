@@ -29,6 +29,12 @@ class Settings(BaseSettings):
         alias="PRESIGNED_URL_EXPIRY_SECONDS",
         ge=1,
     )
+    sqs_job_queue_url: str = Field(alias="SQS_JOB_QUEUE_URL", min_length=1)
+    worker_simulated_processing_seconds: int = Field(
+        default=5,
+        alias="WORKER_SIMULATED_PROCESSING_SECONDS",
+        ge=0,
+    )
 
     @property
     def max_upload_size_bytes(self) -> int:
@@ -38,5 +44,6 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     # Cached so we only parse env vars once per process.
-    # S3_INPUT_BUCKET is required from the environment (no Python default).
+    # S3_INPUT_BUCKET and SQS_JOB_QUEUE_URL are required from the environment
+    # (no Python defaults).
     return Settings()  # pyright: ignore[reportCallIssue]

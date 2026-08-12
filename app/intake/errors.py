@@ -8,4 +8,4 @@ class AppApiError(Exception):
         self.status_code = status_code
         self.code = code
         self.message = message
-        super().__init__(message)
+        super().__init__(message)  # Included in the error response and logs.

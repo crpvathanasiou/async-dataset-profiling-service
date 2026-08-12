@@ -14,3 +14,15 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: async-dataset-profiling-service-worker
+    command: ["python", "-m", "app.worker.main"]
+    env_file:
+      - .env
+    healthcheck:
+      disable: true
+    restart: unless-stopped

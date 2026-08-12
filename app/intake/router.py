@@ -4,6 +4,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, UploadFile, status
 
 from app.infrastructure.s3 import S3Storage
+from app.infrastructure.sqs import SQSQueue
 from app.intake.errors import AppApiError
 from app.intake.job_registry import InMemoryJobRegistry, get_job_registry
 from app.intake.schemas import (
@@ -29,6 +30,12 @@ router = APIRouter(prefix="/api/v1/intake", tags=["intake"])
 def get_s3_storage() -> S3Storage:
     settings = get_settings()
     return S3Storage(region_name=settings.aws_region, bucket=settings.s3_input_bucket)
+
+
+@lru_cache(maxsize=1)
+def get_sqs_queue() -> SQSQueue:
+    settings = get_settings()
+    return SQSQueue(region_name=settings.aws_region, queue_url=settings.sqs_job_queue_url)
 
 
 @router.post(
@@ -75,13 +82,17 @@ def create_upload(
     ),
     responses={
         404: {"model": ApiErrorResponse, "description": "Job or S3 object not found."},
-        503: {"model": ApiErrorResponse, "description": "S3 access or availability failure."},
+        503: {
+            "model": ApiErrorResponse,
+            "description": "S3 or SQS access/availability failure.",
+        },
     },
 )
 def validate_job(
     job_id: str,
     settings: Annotated[Settings, Depends(get_settings)],
     s3: Annotated[S3Storage, Depends(get_s3_storage)],
+    sqs: Annotated[SQSQueue, Depends(get_sqs_queue)],
     registry: Annotated[InMemoryJobRegistry, Depends(get_job_registry)],
 ) -> IntakeJobResponse:
     try:
@@ -89,6 +100,7 @@ def validate_job(
             job_id=job_id,
             settings=settings,
             s3=s3,
+            sqs=sqs,
             registry=registry,
         )
     except IntakeServiceError as exc:

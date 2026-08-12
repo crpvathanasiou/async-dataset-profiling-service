@@ -9,6 +9,7 @@ from app.infrastructure.s3 import (
     S3Storage,
     S3UnavailableError,
 )
+from app.infrastructure.sqs import SQSAccessDeniedError, SQSQueue, SQSUnavailableError
 from app.intake.job_registry import IntakeJobRecord, JobRegistry
 from app.intake.schemas import (
     CreateUploadResponse,
@@ -26,9 +27,19 @@ from app.intake.validators import (
     validate_file,
     validate_filename,
 )
+from app.messaging.schemas import build_process_dataset_message
 from app.settings import Settings
 
 logger = logging.getLogger("async-dataset-profiling-service.intake")
+
+# M3 technical debt:
+# - No transactional outbox (no persistent DB). Publish failure leaves the job
+#   VALIDATING so /validate can be retried.
+# - Process-local message_published prevents duplicate publishes within this
+#   process only. A crash between successful SQS SendMessage and updating the
+#   in-memory registry can still produce a duplicate on retry. Durable
+#   idempotency / transactional outbox remains future work. Do not treat M3 as
+#   exactly-once publishing.
 
 
 class IntakeServiceError(Exception):
@@ -120,6 +131,7 @@ def validate_s3_intake_job(
     job_id: str,
     settings: Settings,
     s3: S3Storage,
+    sqs: SQSQueue,
     registry: JobRegistry,
 ) -> IntakeJobResponse:
     """Validate an object previously reserved via the presigned upload flow."""
@@ -212,10 +224,81 @@ def validate_s3_intake_job(
         settings=settings,
         known_size_bytes=size_bytes,
     )
+
+    if response.status == JobStatus.VALIDATED:
+        if record.message_published:
+            logger.info(
+                "intake job_id=%s message_id=%s already_published skip_publish",
+                job_id,
+                record.published_message_id,
+            )
+        else:
+            published_message_id = _publish_process_dataset(
+                job_id=job_id,
+                s3_bucket=s3.bucket,
+                s3_key=record.s3_key,
+                sqs=sqs,
+            )
+            registry.mark_published(job_id, published_message_id)
+
     registry.update_status(job_id, response.status)
     return response
 
 
+def _publish_process_dataset(
+    *,
+    job_id: str,
+    s3_bucket: str,
+    s3_key: str,
+    sqs: SQSQueue,
+) -> str:
+    """
+    Publish a PROCESS_DATASET command after successful Stage 1 validation.
+
+    Returns the publisher-generated message_id. Caller must mark the job published
+    only after this returns successfully.
+    """
+    command = build_process_dataset_message(
+        job_id=job_id,
+        s3_bucket=s3_bucket,
+        s3_key=s3_key,
+    )
+    try:
+        sqs_message_id = sqs.send_message(body=command.model_dump_json())
+    except SQSAccessDeniedError as exc:
+        logger.error(
+            "intake job_id=%s message_id=%s sqs_publish_failed reason=access_denied",
+            job_id,
+            command.message_id,
+        )
+        raise IntakeServiceError(
+            IntakeErrorCode.SQS_ACCESS_DENIED,
+            "Access to the job queue was denied.",
+        ) from exc
+    except SQSUnavailableError as exc:
+        logger.error(
+            "intake job_id=%s message_id=%s sqs_publish_failed reason=unavailable",
+            job_id,
+            command.message_id,
+        )
+        raise IntakeServiceError(
+            IntakeErrorCode.SQS_UNAVAILABLE,
+            "The job queue is temporarily unavailable.",
+        ) from exc
+
+    logger.info(
+        "intake job_id=%s message_id=%s message_type=%s sqs_message_id=%s published",
+        job_id,
+        command.message_id,
+        command.message_type.value,
+        sqs_message_id,
+    )
+    return command.message_id
+
+
+# _ means Private (Internal)
+# * (Standalone Asterisk) means "All arguments are required"
+# -> IntakeJobResponse: means "Return an IntakeJobResponse"
 def _validate_content(
     *,
     job_id: str,

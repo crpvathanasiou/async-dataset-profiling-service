@@ -41,7 +41,7 @@ app = FastAPI(
 )
 app.include_router(intake_router)
 
-
+# Exception handlers: registered at startup; invoked when the matching exception is raised.
 @app.exception_handler(AppApiError)
 async def app_api_error_handler(_request: Request, exc: AppApiError) -> JSONResponse:
     body = ApiErrorResponse(code=exc.code, message=exc.message)

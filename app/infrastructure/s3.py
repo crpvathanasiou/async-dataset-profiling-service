@@ -88,6 +88,8 @@ class S3Storage:
     client is created with an explicit region (required for correct SigV4
     signing) and the standard AWS credential provider chain, so no credentials
     are ever embedded in the application.
+
+    we can consider it as a wrapper around the boto3 S3 operations used by Stage 1 intake.
     """
 
     def __init__(self, *, region_name: str, bucket: str, client: Any | None = None) -> None:

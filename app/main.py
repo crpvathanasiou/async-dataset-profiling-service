@@ -21,6 +21,9 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY, HTTP_500_INTERNAL_SERVER_ERROR
+
 
 from app.intake.errors import AppApiError
 from app.intake.router import router as intake_router
@@ -76,6 +79,7 @@ app = FastAPI(
 )
 # Feature routes are mounted, not defined here; the router owns its own prefix
 # and tags so this file does not accumulate HTTP details.
+# include_router = Assembler: Takes the ready-made building blocks that we made (Prefixes, Sub-paths, Tags, Dependencies)
 app.include_router(intake_router)
 
 
@@ -131,3 +135,37 @@ def health_ready() -> HealthResponse:
 def version() -> dict[str, str]:
     """Report the deployed build, injected via `APP_VERSION`."""
     return {"version": settings.app_version}
+
+
+# ------------------------------------------------------------------
+# 1. Handle Validation Errors (Invalid inputs from the client - 422)
+# ------------------------------------------------------------------
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    body = ApiErrorResponse(
+        code="INVALID_INPUT",
+        message="The request payload or parameters are invalid."
+    )
+    return JSONResponse(
+        status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+        content=body.model_dump()
+    )
+
+
+# ------------------------------------------------------------------
+# 2. Handle Catch-All / Unexpected Errors (Unexpected errors - 500)
+# ------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    # Log the actual exception and stack trace for debugging
+    logger.exception("Unhandled exception occurred: %s", str(exc))
+    
+    # Return a safe, generic message to the client without exposing internal details
+    body = ApiErrorResponse(
+        code="INTERNAL_SERVER_ERROR",
+        message="An unexpected error occurred. Please try again later."
+    )
+    return JSONResponse(
+        status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+        content=body.model_dump()
+    )
